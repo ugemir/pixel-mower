@@ -872,8 +872,10 @@ function createRenderer(canvas, state) {
     const bufferSpots = state.level.bufferSpots;
     const laneCount = state.level.activeTrucks; // number of lanes
 
-    // Lanes live ABOVE the board: boxes arrive from behind (the top), the
-    // front box sits at the bottom of its stack, facing the board.
+    // The whole collection UI lives ABOVE the board: lane stacks first
+    // (boxes arrive from behind/the top, fronts facing down), then the
+    // waiting rack directly above the board. The bottom of the screen stays
+    // free for the steering thumb.
     const nextH = 18;
     const nextGap = 5;
     const frontH = 54;
@@ -881,12 +883,13 @@ function createRenderer(canvas, state) {
     const lanesY = topH + 8;
     const laneAreaH = countH + 3 * (nextH + nextGap) + 4 + frontH;
 
-    const boardY = lanesY + laneAreaH + 14;
     const slotH = 48;
-    const S = Math.min(W - 30, H - boardY - slotH - 60);
+    const slotsY = lanesY + laneAreaH + 10;
+
+    const boardY = slotsY + slotH + 14;
+    const S = Math.min(W - 30, H - boardY - 24);
     const boardX = (W - S) / 2;
 
-    const slotsY = boardY + S + 22;
     const slotGap = 8;
     const slotW = Math.min((S - slotGap * (bufferSpots - 1)) / bufferSpots, S / 5.2);
     const slotsX = boardX + (S - (slotW * bufferSpots + slotGap * (bufferSpots - 1))) / 2;
