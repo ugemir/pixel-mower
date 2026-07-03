@@ -392,6 +392,12 @@ function validateLevel(level, { minPixels = 500, maxPixels = 700 } = {}) {
     throw new Error(`pixel count ${total} outside allowed range ${minPixels}-${maxPixels}`);
   }
 
+  if (level.collection === false) {
+    // coverage mode: the box-queue invariants don't apply
+    validateFootprintAndSpawn(level);
+    return;
+  }
+
   if (!Number.isInteger(boxCapacity) || boxCapacity < 1) throw new Error('boxCapacity must be >= 1');
   if (!Number.isInteger(activeTrucks) || activeTrucks < 1) throw new Error('activeTrucks must be >= 1');
   if (!Number.isInteger(bufferSpots) || bufferSpots < 1) throw new Error('bufferSpots must be >= 1');
@@ -417,9 +423,14 @@ function validateLevel(level, { minPixels = 500, maxPixels = 700 } = {}) {
     if (!(color in counts)) throw new Error(`box color '${color}' has no pixels in art`);
   }
 
-  const footprint = buildFootprint(level);
-  assertContiguous(footprint, boardSize);
+  validateFootprintAndSpawn(level);
+}
 
+function validateFootprintAndSpawn(level) {
+  const footprint = buildFootprint(level);
+  assertContiguous(footprint, level.boardSize);
+
+  const { spawn } = level;
   if (!Array.isArray(spawn) || spawn.length !== 2) throw new Error('spawn must be [head, tail]');
   for (const cell of spawn) {
     if (!footprint[cell.y]?.[cell.x]) {
@@ -466,9 +477,10 @@ function assertContiguous(footprint, size) {
 // Mower movement rules. Pure logic — no DOM, no Canvas.
 // The mower is 1x2: a head cell and a tail cell, always adjacent.
 
-function legal(footprint, x, y) {
+function isLegal(footprint, x, y) {
   return y >= 0 && y < footprint.length && x >= 0 && x < footprint[0].length && footprint[y][x];
 }
+const legal = isLegal;
 
 // Greedy chase toward target: step along the larger-delta axis, fall back to
 // the other axis if blocked. No pathfinding — the player steers around
@@ -489,6 +501,82 @@ function chooseStep(footprint, head, target) {
 function applyStep(mower, dir) {
   mower.tail = { ...mower.head };
   mower.head = { x: mower.head.x + dir.dx, y: mower.head.y + dir.dy };
+}
+
+// ===== src/core/slide.js =====
+// Slide-mode movement helpers. Pure logic — no DOM, no Canvas.
+//
+// Slide rule: cleaned ground is slippery (runs to the wall); the slide stops
+// where a stretch of grass-or-grass-adjacent ground ends. Passing beside
+// grass creating stops is what keeps remaining pixels reachable — but blob
+// footprints can still strand a few cells outside every slide orbit, which
+// grassReachable() detects (the shell then sweeps them up).
+
+
+
+
+const DIRS = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }];
+
+// A cell brakes the slide if it, or any footprint neighbor, still has grass.
+function grassNear(state, x, y) {
+  if (cellHasPixel(state.art, x, y)) return true;
+  for (const { dx, dy } of DIRS) {
+    if (isLegal(state.footprint, x + dx, y + dy) && cellHasPixel(state.art, x + dx, y + dy)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Walk a slide from `start` without mutating state. Returns the path cells,
+// the stop position, and how many pixels the slide would cut.
+function walkSlide(state, start, dir) {
+  let head = { ...start };
+  const cells = [];
+  let cut = 0;
+  while (isLegal(state.footprint, head.x + dir.dx, head.y + dir.dy) && cells.length <= 60) {
+    head = { x: head.x + dir.dx, y: head.y + dir.dy };
+    cells.push({ ...head });
+    cut += countPixels(state.art, head);
+    const ax = head.x + dir.dx;
+    const ay = head.y + dir.dy;
+    if (grassNear(state, head.x, head.y) && (!isLegal(state.footprint, ax, ay) || !grassNear(state, ax, ay))) {
+      break;
+    }
+  }
+  return { cells, end: head, cut };
+}
+
+// Can any sequence of slides from the current position still cut grass?
+// BFS over slide stop positions.
+function grassReachable(state) {
+  const start = state.mower.head;
+  const seen = new Set([`${start.x},${start.y}`]);
+  const queue = [start];
+  while (queue.length) {
+    const pos = queue.shift();
+    for (const dir of DIRS) {
+      const walk = walkSlide(state, pos, dir);
+      if (!walk.cells.length) continue;
+      if (walk.cut > 0) return true;
+      const key = `${walk.end.x},${walk.end.y}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        queue.push(walk.end);
+      }
+    }
+  }
+  return false;
+}
+
+function countPixels(art, cell) {
+  let n = 0;
+  for (let dy = 0; dy < 2; dy++) {
+    for (let dx = 0; dx < 2; dx++) {
+      if (art[cell.y * 2 + dy][cell.x * 2 + dx] !== '.') n++;
+    }
+  }
+  return n;
 }
 
 // ===== src/core/collection.js =====
@@ -597,11 +685,18 @@ function departIfFull(col, lane, events) {
 
 const MOWER_SPEED = 7; // cells per second
 const COMBO_WINDOW = 0.8; // seconds between cuts that keep a combo alive
+const SLIDE_SPEED = 16; // cells per second while sliding
 
+// level.collection === false runs a pure coverage game (slide mode): no
+// boxes, no rack, no fail state — clean everything to win.
 function createGame(level, opts) {
   validateLevel(level, opts);
-  const collection = createCollection(level);
-  settle(collection, []); // initial trucks arrive silently
+  let collection = null;
+  if (level.collection !== false) {
+    collection = createCollection(level);
+    settle(collection, []); // initial trucks arrive silently
+  }
+  const total = Object.values(countColors(level.art)).reduce((a, b) => a + b, 0);
   return {
     level,
     art: level.art.map((row) => row.split('')),
@@ -611,11 +706,12 @@ function createGame(level, opts) {
     combo: { count: 0, timer: 0 },
     status: 'playing',
     moveTimer: 0,
-    remaining: Object.values(countColors(level.art)).reduce((a, b) => a + b, 0),
+    remaining: total,
+    totalPixels: total,
   };
 }
 
-function step(state, target, dt) {
+function step(state, target, dt, speed = MOWER_SPEED) {
   if (state.status !== 'playing') return [];
   const events = [];
 
@@ -625,7 +721,7 @@ function step(state, target, dt) {
   }
 
   state.moveTimer += dt;
-  const interval = 1 / MOWER_SPEED;
+  const interval = 1 / speed;
   while (state.moveTimer >= interval && state.status === 'playing') {
     const dir = chooseStep(state.footprint, state.mower.head, target);
     if (!dir) {
@@ -652,10 +748,33 @@ function step(state, target, dt) {
       state.combo.timer = COMBO_WINDOW;
       events.push({ type: 'combo', count: state.combo.count });
     }
-    if (state.status === 'playing' && state.remaining === 0 && isCollectionDone(state.collection)) {
+    if (
+      state.status === 'playing' &&
+      state.remaining === 0 &&
+      (!state.collection || isCollectionDone(state.collection))
+    ) {
       state.status = 'complete';
       events.push({ type: 'complete' });
     }
+  }
+  return events;
+}
+
+// Coverage-mode finisher: when no slide sequence can reach the last few
+// pixels (blob footprints can strand cells outside every slide orbit), the
+// game sweeps them up instead of soft-locking.
+function vacuumRemaining(state) {
+  if (state.status !== 'playing') return [];
+  const events = [];
+  const size = state.level.boardSize;
+  for (let cy = 0; cy < size && state.status === 'playing'; cy++) {
+    for (let cx = 0; cx < size && state.status === 'playing'; cx++) {
+      cutCell(state, { x: cx, y: cy }, events);
+    }
+  }
+  if (state.remaining === 0 && (!state.collection || isCollectionDone(state.collection))) {
+    state.status = 'complete';
+    events.push({ type: 'complete' });
   }
   return events;
 }
@@ -672,6 +791,7 @@ function cutCell(state, cell, events) {
       state.remaining--;
       cutAny = true;
       events.push({ type: 'cut', color, ax, ay, cell: { x: cell.x, y: cell.y } });
+      if (!state.collection) continue; // coverage mode: no routing, no fail
       const routeEvents = routeUnit(state.collection, color);
       events.push(...routeEvents);
       if (routeEvents.some((e) => e.type === 'overflow')) {
@@ -693,7 +813,9 @@ function cutCell(state, cell, events) {
 const NUDGE_PX = 14;
 
 function createDrag(canvas, { onStart } = {}) {
-  const input = { active: false, dir: null };
+  // dirSeq increments on every registered nudge, so consumers that treat
+  // nudges as discrete events (slide mode) can tell a new one arrived.
+  const input = { active: false, dir: null, dirSeq: 0 };
   let anchor = null;
 
   canvas.addEventListener('pointerdown', (e) => {
@@ -719,6 +841,7 @@ function createDrag(canvas, { onStart } = {}) {
     input.dir = Math.abs(dx) >= Math.abs(dy)
       ? { dx: Math.sign(dx), dy: 0 }
       : { dx: 0, dy: Math.sign(dy) };
+    input.dirSeq++;
     // Re-anchor: the next nudge is measured from here, so a small move in a
     // new direction turns immediately no matter how far the finger drifted.
     anchor = p;
@@ -875,15 +998,17 @@ function createRenderer(canvas, state) {
     // The whole collection UI lives ABOVE the board: lane stacks first
     // (boxes arrive from behind/the top, fronts facing down), then the
     // waiting rack directly above the board. The bottom of the screen stays
-    // free for the steering thumb.
+    // free for the steering thumb. Coverage mode (no collection) collapses
+    // all of it into a single progress bar.
+    const hasCollection = state.collection !== null;
     const nextH = 18;
     const nextGap = 5;
     const frontH = 54;
     const countH = 14; // "+N" strip above the stacks
     const lanesY = topH + 8;
-    const laneAreaH = countH + 3 * (nextH + nextGap) + 4 + frontH;
+    const laneAreaH = hasCollection ? countH + 3 * (nextH + nextGap) + 4 + frontH : 30;
 
-    const slotH = 48;
+    const slotH = hasCollection ? 48 : 0;
     const slotsY = lanesY + laneAreaH + 10;
 
     const boardY = slotsY + slotH + 14;
@@ -902,6 +1027,7 @@ function createRenderer(canvas, state) {
       slotsY, slotsX, slotW, slotH, slotGap,
       lanesY, lanesX, laneW, laneGap, frontH, nextH, nextGap, countH,
       badgeRect: { x: (W - 128) / 2, y: 12, w: 128, h: 40 },
+      modeRect: { x: 12, y: 12, w: 88, h: 40 },
     };
   }
 
@@ -911,10 +1037,15 @@ function createRenderer(canvas, state) {
     ctx.fillRect(0, 0, L.W, L.H);
 
     drawBadge(L);
+    drawModePill(L, extras.mode);
     drawBoard(L, state);
     drawMower(L, mpos);
-    drawBuffer(L, state, extras.fx);
-    drawLanes(L, state, extras.fx);
+    if (state.collection) {
+      drawBuffer(L, state, extras.fx);
+      drawLanes(L, state, extras.fx);
+    } else {
+      drawProgress(L, state);
+    }
     if (state.status === 'complete') drawOverlay(L, 'Level Complete!', 'Tap for next level');
     if (state.status === 'failed') drawOverlay(L, 'Out of space!', 'Tap to retry');
     if (extras.pickerOpen) drawPicker(L, extras.levelCount, extras.currentLevel);
@@ -1086,6 +1217,44 @@ function createRenderer(canvas, state) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(`Level ${state.level.id} ▾`, L.W / 2, b.y + b.h / 2 + 1);
+  }
+
+  // Coverage-mode progress bar (slide mode has no collection UI).
+  function drawProgress(L, state) {
+    const frac = 1 - state.remaining / state.totalPixels;
+    const x = L.boardX;
+    const y = L.lanesY;
+    const w = L.S;
+    const h = 24;
+    rr(ctx, x, y, w, h, 12);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fill();
+    if (frac > 0) {
+      rr(ctx, x, y, Math.max(h, w * frac), h, 12);
+      ctx.fillStyle = '#8FD96A';
+      ctx.fill();
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${Math.floor(frac * 100)}%`, x + w / 2, y + h / 2 + 1);
+  }
+
+  // Mode toggle: MOW (steer freely) / SLIDE (launch until the wall).
+  function drawModePill(L, mode) {
+    const b = L.modeRect;
+    rr(ctx, b.x, b.y, b.w, b.h, 20);
+    ctx.fillStyle = mode === 'slide' ? '#3E8ED0' : COLORS.badge;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.frameEdge;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(mode === 'slide' ? 'SLIDE' : 'MOW', b.x + b.w / 2, b.y + b.h / 2 + 1);
   }
 
   function drawBoard(L, state) {
@@ -1305,10 +1474,19 @@ function thud() {
 
 
 
+
+
 const canvas = document.getElementById('game');
 // ?level=N jumps straight to a level for testing (1-based).
 const requested = parseInt(new URLSearchParams(location.search).get('level'), 10);
 let levelIdx = Math.min(Math.max((requested || 1) - 1, 0), levels.length - 1);
+
+// Modes: 'mow' = hold & steer with the box-queue puzzle. 'slide' = a nudge
+// launches the mower and it slides until the edge or the end of a grass run
+// (maze style); pure coverage — no boxes, no rack, no fail: clean 100%.
+let mode = 'mow';
+let slideDir = null;
+let lastDirSeq = 0;
 
 let state = createGame(levels[levelIdx]);
 const renderer = createRenderer(canvas, state);
@@ -1317,12 +1495,16 @@ const particles = createParticles();
 
 function loadLevel(i) {
   levelIdx = i;
-  state = createGame(levels[i]);
+  const base = levels[i];
+  const level = mode === 'slide' ? { ...base, collection: false } : base;
+  state = createGame(level);
   animator = createAnimator(state);
   renderer.setState(state);
   particles.clear();
   fx.truckPulse = {};
   fx.slotFlash = {};
+  slideDir = null;
+  lastDirSeq = input.dirSeq;
 }
 
 const ui = { pickerOpen: false };
@@ -1335,6 +1517,11 @@ const input = createDrag(canvas, {
       const hit = pickerRects(renderer.layout, levels.length).findIndex((b) => inRect(point, b));
       ui.pickerOpen = false;
       if (hit >= 0) loadLevel(hit);
+      return false;
+    }
+    if (inRect(point, renderer.layout.modeRect)) {
+      mode = mode === 'mow' ? 'slide' : 'mow';
+      loadLevel(levelIdx);
       return false;
     }
     if (inRect(point, renderer.layout.badgeRect)) {
@@ -1404,6 +1591,29 @@ function handleEvents(events) {
   }
 }
 
+// The cell fed to core as the movement target, per mode.
+function computeTarget() {
+  const head = state.mower.head;
+  if (mode === 'mow') {
+    // steering: direction follows the finger live; release stops
+    return input.active && input.dir
+      ? { x: head.x + input.dir.dx, y: head.y + input.dir.dy }
+      : null;
+  }
+  // slide: a nudge launches, direction locks until the edge stops it —
+  // mid-slide nudges are consumed and ignored, release doesn't stop it
+  if (slideDir && !isLegal(state.footprint, head.x + slideDir.dx, head.y + slideDir.dy)) {
+    slideDir = null;
+  }
+  if (input.dirSeq !== lastDirSeq) {
+    lastDirSeq = input.dirSeq;
+    if (!slideDir && input.dir && isLegal(state.footprint, head.x + input.dir.dx, head.y + input.dir.dy)) {
+      slideDir = { ...input.dir };
+    }
+  }
+  return slideDir ? { x: head.x + slideDir.dx, y: head.y + slideDir.dy } : null;
+}
+
 function decayFx(obj, dt) {
   for (const k of Object.keys(obj)) {
     obj[k] -= dt;
@@ -1420,12 +1630,28 @@ function frame(now) {
   last = now;
   acc += frameDt;
   while (acc >= FIXED_DT) {
-    // Steering direction → the cell one step ahead of the mower; core keeps
-    // stepping toward it, so the mower cruises until blocked or re-steered.
-    const target = input.active && input.dir
-      ? { x: state.mower.head.x + input.dir.dx, y: state.mower.head.y + input.dir.dy }
-      : null;
-    handleEvents(step(state, target, FIXED_DT));
+    const events = step(state, computeTarget(), FIXED_DT, mode === 'slide' ? SLIDE_SPEED : MOWER_SPEED);
+    handleEvents(events);
+    // Slide rule: cleaned ground is slippery (slide to the wall), but grass
+    // brakes — the mower stops where a stretch of grass, or of ground
+    // touching grass, ends. Passing beside grass creating stops is what
+    // keeps every last pixel reachable (pure wall-stops strand remnants).
+    if (mode === 'slide' && slideDir && events.some((e) => e.type === 'move')) {
+      const head = state.mower.head;
+      const nx = head.x + slideDir.dx;
+      const ny = head.y + slideDir.dy;
+      if (
+        grassNear(state, head.x, head.y) &&
+        (!isLegal(state.footprint, nx, ny) || !grassNear(state, nx, ny))
+      ) {
+        slideDir = null;
+        // Finisher: if no slide sequence can reach the leftovers, sweep them
+        // up instead of soft-locking the level.
+        if (state.status === 'playing' && state.remaining > 0 && !grassReachable(state)) {
+          handleEvents(vacuumRemaining(state));
+        }
+      }
+    }
     acc -= FIXED_DT;
   }
   animator.update(frameDt);
@@ -1435,6 +1661,7 @@ function frame(now) {
   renderer.draw(state, animator.pos, {
     particles,
     fx,
+    mode,
     pickerOpen: ui.pickerOpen,
     currentLevel: levelIdx,
     levelCount: levels.length,
