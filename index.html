@@ -691,51 +691,55 @@ function cutCell(state, cell, events) {
 }
 
 // ===== src/input/drag.js =====
-// Hold & drag input: while the pointer is down, `input.target` is the board
-// cell the mower should chase. Pointer Events cover both touch and mouse.
+// Hold & steer input: press and hold, then nudge the finger a little in a
+// direction — the mower keeps moving that way on its own. A small nudge in
+// another direction turns it. No finger-chasing: the finger can stay still.
 
-// Target sits above the finger so the finger doesn't hide the mower.
-const FINGER_OFFSET_TILES = 1.2;
+// How far (px) a nudge must travel to register as a steer.
+const NUDGE_PX = 14;
 
-function createDrag(canvas, getLayout, { onStart } = {}) {
-  const input = { active: false, target: null };
-
-  function updateTarget(e) {
-    const L = getLayout();
-    const rect = canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left - L.boardX;
-    const py = e.clientY - rect.top - L.boardY - FINGER_OFFSET_TILES * L.cellPx;
-    input.target = {
-      x: clamp(Math.floor(px / L.cellPx), 0, L.boardSize - 1),
-      y: clamp(Math.floor(py / L.cellPx), 0, L.boardSize - 1),
-    };
-  }
+function createDrag(canvas, { onStart } = {}) {
+  const input = { active: false, dir: null };
+  let anchor = null;
 
   canvas.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     // onStart gets the tap point (canvas coords) and may claim the tap
-    // (UI hit: badge, picker, overlays) by returning false — no drag then.
+    // (UI hit: badge, picker, overlays) by returning false — no steering then.
     const rect = canvas.getBoundingClientRect();
     const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     if (onStart?.(point) === false) return;
     canvas.setPointerCapture(e.pointerId);
     input.active = true;
-    updateTarget(e);
+    input.dir = null; // waits for the first nudge
+    anchor = point;
   });
+
   canvas.addEventListener('pointermove', (e) => {
-    if (input.active) updateTarget(e);
+    if (!input.active) return;
+    const rect = canvas.getBoundingClientRect();
+    const p = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const dx = p.x - anchor.x;
+    const dy = p.y - anchor.y;
+    if (Math.hypot(dx, dy) < NUDGE_PX) return;
+    input.dir = Math.abs(dx) >= Math.abs(dy)
+      ? { dx: Math.sign(dx), dy: 0 }
+      : { dx: 0, dy: Math.sign(dy) };
+    // Re-anchor: the next nudge is measured from here, so a small move in a
+    // new direction turns immediately no matter how far the finger drifted.
+    anchor = p;
   });
+
   for (const type of ['pointerup', 'pointercancel']) {
     canvas.addEventListener(type, () => {
       input.active = false;
-      input.target = null;
+      input.dir = null;
+      anchor = null;
     });
   }
 
   return input;
 }
-
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ===== src/render/animator.js =====
 // Smooths the mower's logical cell positions into continuous render
@@ -1304,7 +1308,7 @@ function loadLevel(i) {
 const ui = { pickerOpen: false };
 const inRect = (p, b) => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
 
-const input = createDrag(canvas, () => renderer.layout, {
+const input = createDrag(canvas, {
   onStart: (point) => {
     unlockAudio();
     if (ui.pickerOpen) {
@@ -1394,7 +1398,12 @@ function frame(now) {
   last = now;
   acc += frameDt;
   while (acc >= FIXED_DT) {
-    handleEvents(step(state, input.active ? input.target : null, FIXED_DT));
+    // Steering direction → the cell one step ahead of the mower; core keeps
+    // stepping toward it, so the mower cruises until blocked or re-steered.
+    const target = input.active && input.dir
+      ? { x: state.mower.head.x + input.dir.dx, y: state.mower.head.y + input.dir.dy }
+      : null;
+    handleEvents(step(state, target, FIXED_DT));
     acc -= FIXED_DT;
   }
   animator.update(frameDt);
