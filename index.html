@@ -512,22 +512,16 @@ function createCollection(level) {
   };
 }
 
-// Advance a lane: its next box becomes the front. Dispatcher rule: every
-// mowing path is forced over base-color pixels, so if no front anywhere
-// accepts the base color the level can dead-end silently — in that case the
-// lane's next base box is pulled forward instead of its queue head.
+// Advance a lane: its next box becomes the front — strict FIFO, so the
+// visible next boxes are always exactly what will arrive. Deadlock safety
+// is handled at level-generation time (queue guard + the solvability-bot
+// test), never by reordering under the player.
 function advanceLane(col, lane, events) {
   if (!lane.queue.length) {
     lane.front = null;
     return;
   }
-  let takeIndex = 0;
-  const baseElsewhere = col.lanes.some((l) => l !== lane && l.front?.color === col.baseColor);
-  if (!baseElsewhere && lane.queue[0] !== col.baseColor) {
-    const j = lane.queue.indexOf(col.baseColor);
-    if (j !== -1) takeIndex = j;
-  }
-  const color = lane.queue.splice(takeIndex, 1)[0];
+  const color = lane.queue.shift();
   lane.front = { color, fill: 0 };
   events.push({ type: 'truckArrived', color, lane: col.lanes.indexOf(lane) });
 }
@@ -875,27 +869,35 @@ function createRenderer(canvas, state) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const boardSize = state.level.boardSize;
     const topH = 58;
-    const S = Math.min(W - 30, H * 0.54);
-    const boardX = (W - S) / 2;
-    const boardY = topH + 16;
     const bufferSpots = state.level.bufferSpots;
     const laneCount = state.level.activeTrucks; // number of lanes
+
+    // Lanes live ABOVE the board: boxes arrive from behind (the top), the
+    // front box sits at the bottom of its stack, facing the board.
+    const nextH = 18;
+    const nextGap = 5;
+    const frontH = 54;
+    const countH = 14; // "+N" strip above the stacks
+    const lanesY = topH + 8;
+    const laneAreaH = countH + 3 * (nextH + nextGap) + 4 + frontH;
+
+    const boardY = lanesY + laneAreaH + 14;
+    const slotH = 48;
+    const S = Math.min(W - 30, H - boardY - slotH - 60);
+    const boardX = (W - S) / 2;
+
     const slotsY = boardY + S + 22;
     const slotGap = 8;
     const slotW = Math.min((S - slotGap * (bufferSpots - 1)) / bufferSpots, S / 5.2);
     const slotsX = boardX + (S - (slotW * bufferSpots + slotGap * (bufferSpots - 1))) / 2;
-    const slotH = Math.min(52, slotW * 0.9);
-    const lanesY = slotsY + slotH + 14;
+
     const laneGap = 14;
     const laneW = Math.min((S - laneGap * (laneCount - 1)) / laneCount, 112);
     const lanesX = boardX + (S - (laneW * laneCount + laneGap * (laneCount - 1))) / 2;
-    const laneAvail = H - lanesY - 12;
-    const frontH = Math.min(76, laneAvail * 0.42);
-    const nextH = Math.max(16, Math.min(26, (laneAvail - frontH - 10) / 3 - 6));
     r.layout = {
       W, H, S, boardX, boardY, cellPx: S / boardSize, boardSize, topH,
       slotsY, slotsX, slotW, slotH, slotGap,
-      lanesY, lanesX, laneW, laneGap, frontH, nextH,
+      lanesY, lanesX, laneW, laneGap, frontH, nextH, nextGap, countH,
       badgeRect: { x: (W - 128) / 2, y: 12, w: 128, h: 40 },
     };
   }
@@ -979,20 +981,52 @@ function createRenderer(canvas, state) {
     }
   }
 
-  // Lanes: each lane's front box fills (open bin with a unit grid); the next
-  // boxes wait behind it, smaller and closed (lidded), advancing as fronts
-  // depart.
+  // Lanes above the board: boxes queue from the top; the front box sits at
+  // the bottom of its stack facing the board, filling as units arrive. Next
+  // boxes are smaller and closed (lidded); strict FIFO — the box nearest the
+  // front is exactly the one that arrives next.
   function drawLanes(L, state, fx = {}) {
     const col = state.collection;
+    const nextsTop = L.lanesY + L.countH;
+    const frontY = nextsTop + 3 * (L.nextH + L.nextGap) + 4;
     for (let i = 0; i < col.lanes.length; i++) {
       const lane = col.lanes[i];
       const x = L.lanesX + i * (L.laneW + L.laneGap);
+
+      // "+N" above the stack — how many more boxes wait beyond the visible 3
+      const more = lane.queue.length - 3;
+      if (more > 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.font = 'bold 12px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(`+${more}`, x + L.laneW / 2, L.lanesY);
+      }
+
+      // next boxes: queue[0] closest to the front, deeper boxes higher up
+      const w2 = L.laneW * 0.72;
+      const x2 = x + (L.laneW - w2) / 2;
+      for (let k = 0; k < 3; k++) {
+        const color = lane.queue[k];
+        if (!color) break;
+        const y = nextsTop + (2 - k) * (L.nextH + L.nextGap);
+        rr(ctx, x2, y, w2, L.nextH, 6);
+        ctx.fillStyle = shade(state.level.palette[color], 0.85);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        // closed lid
+        rr(ctx, x2 + 3, y + 3, w2 - 6, Math.max(3, L.nextH * 0.28), 3);
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.fill();
+      }
 
       if (lane.front) {
         const paint = state.level.palette[lane.front.color];
         const pulse = fx.truckPulse?.[lane.front.color] > 0 ? 1.06 : 1;
         ctx.save();
-        ctx.translate(x + L.laneW / 2, L.lanesY + L.frontH / 2);
+        ctx.translate(x + L.laneW / 2, frontY + L.frontH / 2);
         ctx.scale(pulse, pulse);
         rr(ctx, -L.laneW / 2, -L.frontH / 2, L.laneW, L.frontH, 10);
         ctx.fillStyle = shade(paint, 0.72);
@@ -1007,35 +1041,9 @@ function createRenderer(canvas, state) {
         ctx.restore();
       } else {
         // exhausted lane — faint empty bin
-        rr(ctx, x, L.lanesY, L.laneW, L.frontH, 10);
+        rr(ctx, x, frontY, L.laneW, L.frontH, 10);
         ctx.fillStyle = 'rgba(0,0,0,0.15)';
         ctx.fill();
-      }
-
-      const w2 = L.laneW * 0.72;
-      const x2 = x + (L.laneW - w2) / 2;
-      for (let k = 0; k < 3; k++) {
-        const color = lane.queue[k];
-        if (!color) break;
-        const y = L.lanesY + L.frontH + 10 + k * (L.nextH + 6);
-        rr(ctx, x2, y, w2, L.nextH, 6);
-        ctx.fillStyle = shade(state.level.palette[color], 0.85);
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.2)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        // closed lid
-        rr(ctx, x2 + 3, y + 3, w2 - 6, Math.max(3, L.nextH * 0.28), 3);
-        ctx.fillStyle = 'rgba(255,255,255,0.35)';
-        ctx.fill();
-      }
-      const more = lane.queue.length - 3;
-      if (more > 0) {
-        ctx.fillStyle = 'rgba(255,255,255,0.55)';
-        ctx.font = 'bold 12px system-ui, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'top';
-        ctx.fillText(`+${more}`, x + L.laneW / 2, L.lanesY + L.frontH + 10 + 3 * (L.nextH + 6) + 2);
       }
     }
   }
