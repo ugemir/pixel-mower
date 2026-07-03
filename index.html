@@ -961,26 +961,35 @@ function createRenderer(canvas, state) {
     }
   }
 
-  // Waiting rack: spots holding same-colored units until a matching box
-  // becomes active.
+  // Waiting rack: the bed stays neutral (its back visible) while units stack
+  // in the grid; only a spot FULL of one color wins that color and paints
+  // over entirely.
   function drawBuffer(L, state, fx = {}) {
     const capacity = state.collection.capacity;
     for (let i = 0; i < state.collection.buffer.length; i++) {
       const x = L.slotsX + i * (L.slotW + L.slotGap);
       const spot = state.collection.buffer[i];
+      const full = spot && spot.count >= capacity;
       const flash = fx.slotFlash?.[i] > 0;
       const grow = flash ? 3 : 0;
       rr(ctx, x - grow, L.slotsY - grow, L.slotW + grow * 2, L.slotH + grow * 2, 10);
-      ctx.fillStyle = spot ? shade(state.level.palette[spot.color], 0.8) : '#B7B2C2';
+      ctx.fillStyle = full ? state.level.palette[spot.color] : '#B7B2C2';
       ctx.fill();
-      ctx.strokeStyle = spot ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.15)';
+      ctx.strokeStyle = full ? 'rgba(255,255,255,0.65)' : 'rgba(0,0,0,0.15)';
       ctx.lineWidth = 2;
       ctx.stroke();
-      drawUnitGrid(
-        x + 5, L.slotsY + 5, L.slotW - 10, L.slotH - 10,
-        capacity, spot ? spot.count : 0,
-        spot ? state.level.palette[spot.color] : '#000'
-      );
+      if (full) {
+        // won: solid color with a gloss highlight
+        rr(ctx, x + 5, L.slotsY + 5, L.slotW - 10, Math.max(4, (L.slotH - 10) * 0.3), 5);
+        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+        ctx.fill();
+      } else {
+        drawUnitGrid(
+          x + 5, L.slotsY + 5, L.slotW - 10, L.slotH - 10,
+          capacity, spot ? spot.count : 0,
+          spot ? state.level.palette[spot.color] : '#000'
+        );
+      }
     }
   }
 
@@ -1376,7 +1385,9 @@ function handleEvents(events) {
         navigator.vibrate?.([20, 30, 20]);
         break;
       case 'bufferAdd':
-        fx.slotFlash[e.spotIndex] = 0.35;
+        // a spot filling completely "wins" its color — celebrate a bit more
+        fx.slotFlash[e.spotIndex] = e.count >= state.collection.capacity ? 0.6 : 0.35;
+        if (e.count >= state.collection.capacity) blip(6);
         break;
       case 'bufferDrain':
         fx.slotFlash[e.spotIndex] = 0.35;
