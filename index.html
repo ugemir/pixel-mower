@@ -686,6 +686,7 @@ function departIfFull(col, lane, events) {
 const MOWER_SPEED = 7; // cells per second
 const COMBO_WINDOW = 0.8; // seconds between cuts that keep a combo alive
 const SLIDE_SPEED = 16; // cells per second while sliding
+const CRUISE_SPEED = 5; // cells per second in always-moving mode
 
 // level.collection === false runs a pure coverage game (slide mode): no
 // boxes, no rack, no fail state — clean everything to win.
@@ -1241,20 +1242,22 @@ function createRenderer(canvas, state) {
     ctx.fillText(`${Math.floor(frac * 100)}%`, x + w / 2, y + h / 2 + 1);
   }
 
-  // Mode toggle: MOW (steer freely) / SLIDE (launch until the wall).
+  // Mode toggle: MOW (steer freely) / SLIDE (launch until the wall) /
+  // CRUISE (always moving, left-right steering only).
   function drawModePill(L, mode) {
     const b = L.modeRect;
+    const paintByMode = { slide: '#3E8ED0', cruise: '#3FA34D' };
     rr(ctx, b.x, b.y, b.w, b.h, 20);
-    ctx.fillStyle = mode === 'slide' ? '#3E8ED0' : COLORS.badge;
+    ctx.fillStyle = paintByMode[mode] ?? COLORS.badge;
     ctx.fill();
     ctx.strokeStyle = COLORS.frameEdge;
     ctx.lineWidth = 2;
     ctx.stroke();
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.font = 'bold 14px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(mode === 'slide' ? 'SLIDE' : 'MOW', b.x + b.w / 2, b.y + b.h / 2 + 1);
+    ctx.fillText((mode ?? 'mow').toUpperCase(), b.x + b.w / 2, b.y + b.h / 2 + 1);
   }
 
   function drawBoard(L, state) {
@@ -1484,8 +1487,12 @@ let levelIdx = Math.min(Math.max((requested || 1) - 1, 0), levels.length - 1);
 // Modes: 'mow' = hold & steer with the box-queue puzzle. 'slide' = a nudge
 // launches the mower and it slides until the edge or the end of a grass run
 // (maze style); pure coverage — no boxes, no rack, no fail: clean 100%.
+// 'cruise' = always moving after the first nudge; only left/right steering
+// (no reversing — dead ends auto U-turn); box-queue puzzle stays on.
+const MODES = ['mow', 'slide', 'cruise'];
 let mode = 'mow';
 let slideDir = null;
+let cruiseDir = null;
 let lastDirSeq = 0;
 
 let state = createGame(levels[levelIdx]);
@@ -1504,6 +1511,7 @@ function loadLevel(i) {
   fx.truckPulse = {};
   fx.slotFlash = {};
   slideDir = null;
+  cruiseDir = null;
   lastDirSeq = input.dirSeq;
 }
 
@@ -1520,7 +1528,7 @@ const input = createDrag(canvas, {
       return false;
     }
     if (inRect(point, renderer.layout.modeRect)) {
-      mode = mode === 'mow' ? 'slide' : 'mow';
+      mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
       loadLevel(levelIdx);
       return false;
     }
@@ -1600,6 +1608,27 @@ function computeTarget() {
       ? { x: head.x + input.dir.dx, y: head.y + input.dir.dy }
       : null;
   }
+  if (mode === 'cruise') {
+    // always moving; nudges only turn left/right, never reverse
+    if (input.dirSeq !== lastDirSeq) {
+      lastDirSeq = input.dirSeq;
+      const c = input.dir;
+      if (c && (!cruiseDir || c.dx !== -cruiseDir.dx || c.dy !== -cruiseDir.dy)) {
+        cruiseDir = { ...c };
+      }
+    }
+    if (!cruiseDir) return null; // waiting for the first nudge
+    // dead end (forward and both sides blocked): auto U-turn
+    const sides = [
+      { dx: cruiseDir.dy, dy: cruiseDir.dx },
+      { dx: -cruiseDir.dy, dy: -cruiseDir.dx },
+    ];
+    const open = (d) => isLegal(state.footprint, head.x + d.dx, head.y + d.dy);
+    if (!open(cruiseDir) && !sides.some(open)) {
+      cruiseDir = { dx: -cruiseDir.dx, dy: -cruiseDir.dy };
+    }
+    return { x: head.x + cruiseDir.dx, y: head.y + cruiseDir.dy };
+  }
   // slide: a nudge launches, direction locks until the edge stops it —
   // mid-slide nudges are consumed and ignored, release doesn't stop it
   if (slideDir && !isLegal(state.footprint, head.x + slideDir.dx, head.y + slideDir.dy)) {
@@ -1630,7 +1659,8 @@ function frame(now) {
   last = now;
   acc += frameDt;
   while (acc >= FIXED_DT) {
-    const events = step(state, computeTarget(), FIXED_DT, mode === 'slide' ? SLIDE_SPEED : MOWER_SPEED);
+    const speed = mode === 'slide' ? SLIDE_SPEED : mode === 'cruise' ? CRUISE_SPEED : MOWER_SPEED;
+    const events = step(state, computeTarget(), FIXED_DT, speed);
     handleEvents(events);
     // Slide rule: cleaned ground is slippery (slide to the wall), but grass
     // brakes — the mower stops where a stretch of grass, or of ground
