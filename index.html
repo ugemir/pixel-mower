@@ -1493,6 +1493,7 @@ const MODES = ['mow', 'slide', 'cruise'];
 let mode = 'mow';
 let slideDir = null;
 let cruiseDir = null;
+let cruiseTurn = null; // queued second half of an auto U-turn
 let lastDirSeq = 0;
 
 let state = createGame(levels[levelIdx]);
@@ -1512,6 +1513,7 @@ function loadLevel(i) {
   fx.slotFlash = {};
   slideDir = null;
   cruiseDir = null;
+  cruiseTurn = null;
   lastDirSeq = input.dirSeq;
 }
 
@@ -1599,6 +1601,41 @@ function handleEvents(events) {
   }
 }
 
+// 90° grid rotations (screen coords, y down). Two of the same = a 180° flip.
+const rotLeft = (d) => ({ dx: d.dy, dy: -d.dx });
+const rotRight = (d) => ({ dx: -d.dy, dy: d.dx });
+
+// Decide how a cruising mower turns at a wall. Preference, so motion never
+// stalls: a full U-turn (two turns the same way — sol-sol / sag-sag), else a
+// single corner turn, else a straight reverse. When a side is a real choice
+// it's 50/50; a forced side (edge of the board) takes the only option.
+function chooseCruiseTurn(head, dir) {
+  const openFrom = (from, d) => isLegal(state.footprint, from.x + d.dx, from.y + d.dy);
+  const uTurn = (rot) => {
+    const d1 = rot(dir);
+    const d2 = rot(d1); // rotating the same way twice reverses heading
+    const mid = { x: head.x + d1.dx, y: head.y + d1.dy };
+    return openFrom(head, d1) && openFrom(mid, d2) ? [d1, d2] : null;
+  };
+  const left = uTurn(rotLeft);
+  const right = uTurn(rotRight);
+  if (left && right) return Math.random() < 0.5 ? left : right;
+  if (left) return left;
+  if (right) return right;
+
+  // No room for a U-turn — follow an open corner (single 90°)…
+  const l1 = rotLeft(dir);
+  const r1 = rotRight(dir);
+  const lOpen = openFrom(head, l1);
+  const rOpen = openFrom(head, r1);
+  if (lOpen && rOpen) return [Math.random() < 0.5 ? l1 : r1];
+  if (lOpen) return [l1];
+  if (rOpen) return [r1];
+
+  // …dead-end corridor: reverse (the cell behind is the tail, always legal).
+  return [{ dx: -dir.dx, dy: -dir.dy }];
+}
+
 // The cell fed to core as the movement target, per mode.
 function computeTarget() {
   const head = state.mower.head;
@@ -1609,23 +1646,26 @@ function computeTarget() {
       : null;
   }
   if (mode === 'cruise') {
-    // always moving; nudges only turn left/right, never reverse
+    // Always moving after the first nudge. Nudges only turn perpendicular
+    // (never reverse) and cancel any pending auto-maneuver.
     if (input.dirSeq !== lastDirSeq) {
       lastDirSeq = input.dirSeq;
       const c = input.dir;
       if (c && (!cruiseDir || c.dx !== -cruiseDir.dx || c.dy !== -cruiseDir.dy)) {
         cruiseDir = { ...c };
+        cruiseTurn = null;
       }
     }
     if (!cruiseDir) return null; // waiting for the first nudge
-    // dead end (forward and both sides blocked): auto U-turn
-    const sides = [
-      { dx: cruiseDir.dy, dy: cruiseDir.dx },
-      { dx: -cruiseDir.dy, dy: -cruiseDir.dx },
-    ];
-    const open = (d) => isLegal(state.footprint, head.x + d.dx, head.y + d.dy);
-    if (!open(cruiseDir) && !sides.some(open)) {
-      cruiseDir = { dx: -cruiseDir.dx, dy: -cruiseDir.dy };
+
+    if (cruiseTurn && cruiseTurn.length) {
+      // second half of a U-turn already committed
+      cruiseDir = cruiseTurn.shift();
+    } else if (!isLegal(state.footprint, head.x + cruiseDir.dx, head.y + cruiseDir.dy)) {
+      // hit a wall: turn instead of stopping (see chooseCruiseTurn)
+      const maneuver = chooseCruiseTurn(head, cruiseDir);
+      cruiseDir = maneuver[0];
+      cruiseTurn = maneuver.slice(1);
     }
     return { x: head.x + cruiseDir.dx, y: head.y + cruiseDir.dy };
   }
