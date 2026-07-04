@@ -1493,7 +1493,7 @@ const MODES = ['mow', 'slide', 'cruise'];
 let mode = 'mow';
 let slideDir = null;
 let cruiseDir = null;
-let cruiseTurn = null; // queued second half of an auto U-turn
+let cruiseNext = null; // heading to adopt after the current move (U-turn 2nd step)
 let lastDirSeq = 0;
 
 let state = createGame(levels[levelIdx]);
@@ -1513,7 +1513,7 @@ function loadLevel(i) {
   fx.slotFlash = {};
   slideDir = null;
   cruiseDir = null;
-  cruiseTurn = null;
+  cruiseNext = null;
   lastDirSeq = input.dirSeq;
 }
 
@@ -1646,26 +1646,26 @@ function computeTarget() {
       : null;
   }
   if (mode === 'cruise') {
-    // Always moving after the first nudge. Nudges only turn perpendicular
-    // (never reverse) and cancel any pending auto-maneuver.
+    // Always moving after the first nudge. A nudge turns perpendicular (never
+    // reverse) and cancels any pending auto-maneuver.
     if (input.dirSeq !== lastDirSeq) {
       lastDirSeq = input.dirSeq;
       const c = input.dir;
       if (c && (!cruiseDir || c.dx !== -cruiseDir.dx || c.dy !== -cruiseDir.dy)) {
         cruiseDir = { ...c };
-        cruiseTurn = null;
+        cruiseNext = null;
       }
     }
     if (!cruiseDir) return null; // waiting for the first nudge
 
-    if (cruiseTurn && cruiseTurn.length) {
-      // second half of a U-turn already committed
-      cruiseDir = cruiseTurn.shift();
-    } else if (!isLegal(state.footprint, head.x + cruiseDir.dx, head.y + cruiseDir.dy)) {
-      // hit a wall: turn instead of stopping (see chooseCruiseTurn)
+    // At a wall with no maneuver pending, plan a turn. The first leg is taken
+    // now (cruiseDir); a U-turn's second leg waits in cruiseNext and is
+    // adopted only AFTER this move completes (in the loop), never mid-cell —
+    // consuming it per-frame was the bug that reversed onto the same lane.
+    if (!cruiseNext && !isLegal(state.footprint, head.x + cruiseDir.dx, head.y + cruiseDir.dy)) {
       const maneuver = chooseCruiseTurn(head, cruiseDir);
       cruiseDir = maneuver[0];
-      cruiseTurn = maneuver.slice(1);
+      cruiseNext = maneuver[1] ?? null;
     }
     return { x: head.x + cruiseDir.dx, y: head.y + cruiseDir.dy };
   }
@@ -1702,6 +1702,12 @@ function frame(now) {
     const speed = mode === 'slide' ? SLIDE_SPEED : mode === 'cruise' ? CRUISE_SPEED : MOWER_SPEED;
     const events = step(state, computeTarget(), FIXED_DT, speed);
     handleEvents(events);
+    // Cruise: the first leg of a U-turn just moved — now adopt its second leg
+    // so the mower shifts one lane over instead of doubling back.
+    if (mode === 'cruise' && cruiseNext && events.some((e) => e.type === 'move')) {
+      cruiseDir = cruiseNext;
+      cruiseNext = null;
+    }
     // Slide rule: cleaned ground is slippery (slide to the wall), but grass
     // brakes — the mower stops where a stretch of grass, or of ground
     // touching grass, ends. Passing beside grass creating stops is what
